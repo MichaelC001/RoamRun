@@ -15,6 +15,7 @@ mod lines;
 mod relay;
 mod remote;
 mod tailscale;
+mod view;
 mod wire;
 
 use clap::{Args, Parser, Subcommand};
@@ -124,6 +125,33 @@ enum Command {
         /// Over HTTP, the devices offered, as `roamrunctl devices` names them: no other is listed or used
         #[arg(requires = "http")]
         devices: Vec<String>,
+    },
+    /// Experimental: watch and touch the device in a browser until Ctrl-C. With --token-file: open localhost on this machine, or add --https for browsers elsewhere on the tailnet; the browser needs HEVC in WebCodecs
+    View {
+        /// The device, as `roamrunctl devices` names it (none with --usb)
+        #[arg(required_unless_present = "usb", conflicts_with = "usb")]
+        name: Option<String>,
+        /// Serve on this port of this machine's Tailscale IPv4 address
+        #[arg(long)]
+        http: u16,
+        /// Who may watch: a login (a person's own machines) or tag:<name>, as `tailscale whois` names them; again for more
+        #[arg(long)]
+        allow: Vec<String>,
+        /// A token the page must also give (it asks): a file of the owner's alone, 32 characters or more. Needed for this machine itself
+        #[arg(long = "token-file")]
+        token_file: Option<std::path::PathBuf>,
+        /// Reach the device at this IPv4 address, not the one it was saved with: its address on this machine's Wi‑Fi, so that the stream doesn't go through Tailscale
+        #[arg(long, value_name = "ADDRESS", conflicts_with = "usb")]
+        at: Option<std::net::Ipv4Addr>,
+        /// The device connected to this machine by USB, through usbmuxd and the pairing this machine's system keeps with it (it trusts this machine): no pairing of roamrunctl's. With several connected, name one by its UDID
+        #[arg(long, value_name = "UDID", num_args = 0..=1, default_missing_value = "")]
+        usb: Option<String>,
+        /// Serve roamrunctl's MCP tools on POST /mcp too, on this device through this connection: an agent's look then takes the picture from this stream instead of starting another (which stops this one's). Callers as for the page, with the token as a bearer
+        #[arg(long, requires = "token_file")]
+        mcp: bool,
+        /// The page over HTTPS too, at this port of this machine's Tailscale name (https://<name>:<port>/), by `tailscale serve` in front of view on localhost: a secure page to any browser on the tailnet, an app's own included. Taken off `tailscale serve` at Ctrl-C; callers need an allowed login and the token (tagged callers use direct HTTP)
+        #[arg(long, value_name = "PORT", requires = "token_file")]
+        https: Option<u16>,
     },
     /// Keep the pairings saved here to yourself and sign with them for another machine, which then uses the devices without having their keys; until Ctrl-C
     Sign {
@@ -832,6 +860,17 @@ mod tests {
         assert_eq!(given(&["roamrunctl", "launch", "a", "b", "--relay", ""]), Ok(None));
         assert_eq!(given(&["roamrunctl", "launch", "a", "b", "--relay", "100.64.0.1:9090"]).map(|g| g.map(|(relay, _)| relay)), Ok(Some("100.64.0.1:9090".into())));
         assert!(given(&["roamrunctl", "launch", "a", "b", "--relay", " ", "--token-file", "t"]).is_err());
+    }
+
+    #[test]
+    fn view_at_is_an_ipv4_address() {
+        let at = |address: &str| match Cli::try_parse_from(["roamrunctl", "view", "phone", "--http", "8099", "--at", address]).map(|cli| cli.command) {
+            Ok(Command::View { at, .. }) => at,
+            _ => None,
+        };
+        assert_eq!(at("192.168.0.19"), Some(Ipv4Addr::new(192, 168, 0, 19)));
+        // Its reachability is asked as "<address>:<port>", which an IPv6 address doesn't make.
+        assert_eq!(at("::1"), None);
     }
 
     #[test]

@@ -254,6 +254,20 @@ import ImageIO
         .ok) // the middle of that image is the middle of the screen
     let tapped = try #require(device.tapped)
     #expect(abs(tapped.x - 0.5) < 0.001 && abs(tapped.y - 0.5) < 0.001)
+    // A pinch, by the look still: its centre the same way, a two-finger tap of 500 ms unless said.
+    #expect(hub.answer(.init(op: "look", device: id, path: png)).ok)
+    #expect(hub.answer(.init(op: "pinch", device: id, x: 295, y: 640, milliseconds: 7000))
+        .error == "a pinch takes 50...5000 ms")
+    #expect(hub.answer(.init(op: "pinch", device: id, x: 295, y: 640)).ok)
+    let pinched = try #require(device.pinched)
+    #expect(abs(pinched.x - 0.5) < 0.001 && abs(pinched.y - 0.5) < 0.001)
+    #expect(pinched.scale == 1 && pinched.degrees == 0 && pinched.milliseconds == 500)
+    #expect(hub.answer(.init(op: "look", device: id, path: png)).ok)
+    #expect(hub.answer(.init(op: "pinch", device: id, x: 295, y: 640, milliseconds: 80, scale: 2, degrees: -30)).ok)
+    #expect(device.pinched.map {
+        [$0.scale, $0.degrees, Double($0.milliseconds)]
+    } == [2, -30, 80])
+    #expect(!hub.answer(.init(op: "pinch", device: id, x: 295, y: 640)).ok) // the look went by the last
     #expect(hub.answer(.init(op: "look", device: id, path: png)).ok)
     #expect(!hub.answer(.init(op: "tap", device: id, x: 600, y: 640))
         .ok) // outside it, though inside the screen's own pixels
@@ -438,6 +452,8 @@ import ImageIO
     #expect(DeviceControlHub.swipeDuration(nil) == 300 && DeviceControlHub.swipeDuration(50) == 50)
     #expect(DeviceControlHub.swipeDuration(5_000_000_000) == nil && DeviceControlHub.swipeDuration(49) == nil)
     #expect(DeviceControlHub.swipeDuration(-1) == nil && DeviceControlHub.swipeDuration(.max) == nil)
+    #expect(DeviceControlHub.pinchDuration(nil) == 500 && DeviceControlHub.pinchDuration(80) == 80)
+    #expect(DeviceControlHub.pinchDuration(-1) == nil && DeviceControlHub.pinchDuration(5001) == nil)
     // The CLI's own: a point or a duration is a finite number, or the command is refused.
     #expect(CLI.finite(["1", "2.5", "1e3"]) == [1, 2.5, 1000])
     #expect(CLI.finite(["1", "inf"]) == nil && CLI.finite(["nan", "1"]) == nil && CLI.finite(["1", "x"]) == nil)
@@ -1134,6 +1150,32 @@ private func listenerSoon(
     #expect(try JSONDecoder().decode(DeviceControlWire.Response.self, from: JSONEncoder().encode(answer)) == answer)
 }
 
+/// An element's line carries its identifier when it has one, and an older app's answer,
+/// captions alone, is read as before.
+@Test func elementsSayTheirIdentifier() throws {
+    let found = ScreenElement.list([
+        ["caption": "Bluetooth, button", "identifier": "com.apple.settings.bluetooth"],
+        ["caption": "General, button", "identifier": 3],
+        ["identifier": "x"],
+    ])
+    #expect(found == [
+        ScreenElement(caption: "Bluetooth, button", identifier: "com.apple.settings.bluetooth"),
+        ScreenElement(caption: "General, button"),
+        ScreenElement(caption: "", identifier: "x"),
+    ])
+    #expect(found.map(\.line) == [
+        "Bluetooth, button — id: com.apple.settings.bluetooth", "General, button", " — id: x",
+    ])
+
+    let decode = { (json: String) in
+        try JSONDecoder().decode(DeviceControlWire.Response.self, from: Data(json.utf8))
+    }
+    #expect(try decode(#"{"ok":true,"captions":["a","b"],"complete":true}"#).elementLines == ["a", "b"])
+    let newer = try decode(#"{"ok":true,"captions":["a"],"elements":[{"caption":"a","identifier":"i"}]}"#)
+    #expect(newer.elementLines == ["a — id: i"])
+    #expect(try decode(#"{"ok":false,"error":"no"}"#).elementLines == nil)
+}
+
 /// A look's number isn't counted from the same place by every run of the app: one kept from
 /// before a restart isn't taken for one made since.
 @Test func looksAreNotNumberedAlikeByEveryStart() throws {
@@ -1283,7 +1325,7 @@ private func listenerSoon(
             $0
         }
     }
-    for op in ["look", "elements", "press", "type", "paste", "tap", "swipe"] {
+    for op in ["look", "elements", "press", "type", "paste", "tap", "swipe", "pinch"] {
         #expect(
             hub.answer(.init(op: op, device: id, path: lookFile(in: dir), text: "home")).error == DeviceControlHub
                 .switchedOff,
@@ -1324,7 +1366,7 @@ private func listenerSoon(
 
 /// An input stops where it is when whoever asked for it leaves, and when its device is switched
 /// off: neither waits for it — a text to be typed out, or any of them for its connection.
-@Test(arguments: ["type", "paste", "press", "tap", "swipe"])
+@Test(arguments: ["type", "paste", "press", "tap", "swipe", "pinch"])
 func anInputIsInterruptedWhenItsAskerLeavesOrItsDeviceIsSwitchedOff(_ op: String) throws {
     for leaving in [true, false] {
         let dir = scratchDir()

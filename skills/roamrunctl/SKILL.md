@@ -255,19 +255,25 @@ believed the first time it is used — use it only if the user named it.
   30 s while the RoamRun app runs on that Mac. If it says another job's upload replaced its own, run it again later, once.
 - `roamrunctl launch <name> <bundle id>` — one already running is ended first.
 - `roamrunctl mcp` — for an agent's MCP config (the command `roamrunctl`, the argument
-  `mcp`): `devices`, `look`, `tap`, `swipe`, `elements`, `type`, `paste`, `press`,
+  `mcp`): `devices`, `look`, `tap`, `swipe`, `pinch`, `elements`, `type`, `paste`, `press`,
   `install`, `install_status`, `launch`. `install` answers once it has begun;
   `install_status` says when the app is in (or why not), and until then every other call on
   that device answers that it is installing — ask `install_status` now and then, then launch.
   Look, act, look again: a look answers with an id (`look 12`) and
-  serves one tap or swipe, within a minute, which gives it (`"look": 12`) with points in
+  serves one tap, swipe or pinch, within a minute, which gives it (`"look": 12`) with points in
   the pixels of the image it returned; looked at again since, by anyone, or turned since a
   look that was the device's picture (below), the device isn't pressed: look again. `type` and `paste` give the latest look's id too, within
   the same minute (after a tap by it is fine, and so is more text) and are refused once
   another look, a button, a launch, an install or `elements` came since: look again. After a
-  tap, swipe, type or paste, a tap or swipe needs a new look. `press` isn't held to a look and
+  tap, swipe, pinch, type or paste, a tap, swipe or pinch needs a new look. `pinch` (0.13.0+)
+  puts two fingers about `x`, `y` and moves them until they are `scale` (0.25–4, default 1)
+  times as far apart — 2 zooms in, 0.5 out — turned clockwise by `degrees` (−180–180, default
+  0), over `milliseconds` (50–5000, default 500), then lifts them; neither: a two-finger tap. A
+  finger that would leave the screen is refused. `press` isn't held to a look and
   goes to whatever is on the screen: look before it too. A
   call that fails may or may not have reached the device — look before doing it again.
+  `elements` gives one caption a line, followed by ` — id: <identifier>` when the app set an
+  accessibility identifier; no positions: find what to tap in a look.
   A call you take back before its turn isn't made. On an iPhone with two screens, opened
   (tried: a foldable one on iOS 27.1), the first tap or swipe of an `mcp` run does nothing (and,
   as seen with RoamRun on a Mac, the first after the device is opened); the next one works: if
@@ -352,14 +358,37 @@ Tailscale. Whether launching works on a device no Xcode ever met wasn't tried.
 
 Tried against a device, on Linux and macOS, in an earlier form of each: `pair control
 --with`, a key from a Mac, look, tap, type, a button, install, launch, `mcp`'s look and
-tap, and B. On macOS, in a later form: `pair control --to`, and `mcp --http` called from the
+tap, and B. On macOS, in a later form: `pair control --to`, `mcp`'s pinch over stdio (on an iPhone Duo, in
+Google Maps and Photos), and `mcp --http` called from the
 machine itself with the token (look, tap, type, `elements`, calls taken back in a session;
 a button in a form just before this one; uploads and their refusals; an install over stdio
 and one from an upload, with `install_status`, and `launch` after). Not
 yet: `sign` as it is now and `ROAMRUNCTL_SIGNER`, `--passphrase`, the Introducer app or a
-Mac introducing this machine, `mcp`'s swipe and a paste that goes through, `mcp --http` from a cloud other than GitHub Actions, and anything on
+Mac introducing this machine, `mcp`'s swipe and a paste that goes through, pinch on Linux or through `mcp --http`, `mcp --http` from a cloud other than GitHub Actions, and anything on
 Windows (it builds there). If one of those fails, say what it
 said; don't work around it.
+
+**`roamrunctl view <device> --http <port> --allow <login> [--at <IPv4 address>]`** is experimental, tried
+on an iPhone Duo in Chrome (through Tailscale its picture often stops until a key frame; `--at`
+reaches the device at its IPv4 address on this machine's Wi‑Fi instead, and `--usb [<UDID>]` in place of
+`<device>` takes the one connected by USB, which lost nothing): the user's own device's screen
+in a browser elsewhere on the tailnet, to watch and touch (the page needs WebCodecs; roamrunctl's reference, under “The screen in a browser”, says how to
+open it). It is the user's to start, at a terminal of their own. While it runs, the
+device is its alone: don't `look`, tap or install on that device meanwhile, nor serve it with `mcp` —
+a look through another connection stops the page's picture for about 9 s. Started with `--mcp`, it
+serves the same MCP tools (no install) at `http://<address>:<port>/mcp` with its token as a bearer:
+an agent operates the device there while people watch, its looks taken from the page's own stream.
+A tap, swipe, type or paste there is refused (“look again”) once a page acted on the device since the
+look; one made while a page's input runs waits for it, then is refused: look again and go on.
+If view's connection to the device goes, it says so: the user starts view again.
+A browser that can't be given Chrome's flag (an app's own) shows the page at `http://localhost:<port>/`
+on that machine (only with `--token-file`), or elsewhere on the tailnet at `https://<name>:<port>/` when
+started with `--https <port>`.
+HTTPS requires `--token-file` and an allowed login; a connection without Tailscale's login header is
+refused. Tagged machines use the direct HTTP endpoint with `--allow tag:<name>`.
+Codex's MCP client was checked over HTTPS with look, tap and swipe while T3 Code's browser watched.
+For Codex, configure the `/mcp` URL and `bearer_token_env_var` naming an environment variable that holds
+the token; keep the token out of the URL and the conversation.
 
 ## 6. What it doesn't do
 

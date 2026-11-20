@@ -142,24 +142,57 @@ fn run(args: &[&str]) -> Result<String, String> {
 /// The same, given `within` to answer: what waits on it (a request) isn't held by a Tailscale that hangs. Not
 /// given this process's input, which is `mcp`'s requests over stdio.
 fn run_within(args: &[&str], within: Duration) -> Result<String, String> {
-    let mut child = command().args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+    answered_within(command().args(args), args[0], within)
+}
+
+fn answered_within(command: &mut Command, what: &str, within: Duration) -> Result<String, String> {
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().map_err(|e| format!("tailscale isn't installed here ({e})"))?;
-    let read = |mut from: Box<dyn Read + Send>| std::thread::spawn(move || { let mut out = String::new(); let _ = from.read_to_string(&mut out); out });
-    let reading = read(Box::new(child.stdout.take().ok_or("tailscale gave no output")?));
-    let said = read(Box::new(child.stderr.take().ok_or("tailscale gave no output")?));
+    let out = Kept::from(child.stdout.take().ok_or("tailscale gave no output")?);
+    let said = Kept::from(child.stderr.take().ok_or("tailscale gave no output")?);
     let until = Instant::now() + within;
     loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            let out = reading.join().unwrap_or_default();
-            let said = said.join().unwrap_or_default();
-            return if status.success() { Ok(out) } else { Err(format!("tailscale {}: {}", args[0], said.trim())) };
+            // Its pipes end with it, unless a child of it (a wrapper script's) holds them: waited on briefly.
+            let by = Instant::now() + AFTER_IT;
+            let (out, said) = (out.by(by), said.by(by));
+            return if status.success() { Ok(out) } else { Err(format!("tailscale {what}: {}", said.trim())) };
         }
         if Instant::now() >= until {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!("tailscale {} didn't answer in {} s", args[0], within.as_secs()));
+            // What it printed before, on either (`serve` says there what it waits for).
+            let by = Instant::now() + AFTER_IT;
+            let out = format!("{}\n{}", out.by(by), said.by(by));
+            let out = out.trim();
+            return Err(format!("tailscale {what} didn't answer in {} s{}", within.as_secs(), if out.is_empty() { String::new() } else { format!(": {}", out.chars().take(500).collect::<String>()) }));
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// How long a pipe is waited on to end once what wrote to it ended (or was killed).
+const AFTER_IT: Duration = Duration::from_millis(500);
+
+/// What a pipe gave, kept as it comes (not only at its end, which a child holding it may put off), and its end.
+struct Kept { text: std::sync::Arc<std::sync::Mutex<Vec<u8>>>, ended: std::sync::mpsc::Receiver<()> }
+
+impl Kept {
+    fn from(mut pipe: impl Read + Send + 'static) -> Kept {
+        let (text, (end, ended)) = (std::sync::Arc::new(std::sync::Mutex::new(Vec::new())), std::sync::mpsc::channel());
+        let into = text.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            while let Ok(n @ 1..) = pipe.read(&mut chunk) { into.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk[..n]) }
+            let _ = end.send(());
+        });
+        Kept { text, ended }
+    }
+
+    /// What it gave by its end, or by `until`.
+    fn by(&self, until: Instant) -> String {
+        let _ = self.ended.recv_timeout(until.saturating_duration_since(Instant::now()));
+        String::from_utf8_lossy(&self.text.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
     }
 }
 
@@ -188,6 +221,60 @@ pub struct WhoisNode {
 pub struct WhoisUser {
     #[serde(rename = "LoginName", default)]
     pub login: String,
+}
+
+/// HTTPS on the tailnet at `https` (Tailscale's certificate for this machine's name), handed to `target` on this
+/// machine, in the background: refused where something is served at that port already.
+/// Where HTTPS isn't turned on for the tailnet, `tailscale serve` says so on its output and may wait for it: it is
+/// held to SERVE_WITHIN, and the port is looked for in its status afterwards.
+/// Taken as served by this only where the port hands on to `target`: another's, set up meanwhile, is neither
+/// taken for it nor taken off.
+pub fn serve_https(https: u16, target: &str) -> Result<(), String> {
+    serve_port_free(&run_within(&["serve", "status", "--json"], SERVE_WITHIN)?, https)?;
+    let said = run_within(&["serve", "--bg", "--yes", &format!("--https={https}"), target], SERVE_WITHIN);
+    let ours = run_within(&["serve", "status", "--json"], SERVE_WITHIN).and_then(|out| handed_to(&out, https, target));
+    let need = "HTTPS certificates may need turning on for the tailnet (the admin console's DNS page)";
+    match (said, ours) {
+        (Ok(_), Ok(true)) => Ok(()),
+        (Ok(said), Ok(false)) => Err(format!("tailscale serve didn't serve port {https} for view{}; {need}", if said.trim().is_empty() { String::new() } else { format!(": {}", said.trim()) })),
+        // Served, as serve said, and its status not readable: taken off, not left for the next start to find.
+        (Ok(_), Err(why)) => { let _ = serve_https_off(https); Err(why) }
+        (Err(why), ours) => {
+            if ours == Ok(true) { let _ = serve_https_off(https); }
+            Err(format!("{why}; {need}"))
+        }
+    }
+}
+
+/// Whether `tailscale serve status --json` has the port hand on to `target` (each name it serves it at).
+fn handed_to(out: &str, https: u16, target: &str) -> Result<bool, String> {
+    if !served(out, https)? { return Ok(false) }
+    let status: serde_json::Value = serde_json::from_str(out).map_err(|e| unreadable("serve status", out, e))?;
+    let suffix = format!(":{https}");
+    let ours = status["Web"].as_object().is_some_and(|web| web.iter().any(|(at, site)| {
+        at.ends_with(&suffix) && site["Handlers"].as_object().is_some_and(|handlers| handlers.values().any(|h| h["Proxy"].as_str() == Some(target)))
+    }));
+    Ok(ours)
+}
+
+/// How long `tailscale serve --bg` gets: it answers at once where it can serve.
+const SERVE_WITHIN: Duration = Duration::from_secs(20);
+
+fn serve_port_free(out: &str, https: u16) -> Result<(), String> {
+    if served(out, https)? { return Err(format!("port {https} is served already (tailscale serve status): pick another for --https")) }
+    Ok(())
+}
+
+/// Whether `tailscale serve status --json` lists that port.
+fn served(out: &str, https: u16) -> Result<bool, String> {
+    let status: serde_json::Value = serde_json::from_str(out).map_err(|e| unreadable("serve status", out, e))?;
+    if !status.is_object() { return Err("tailscale serve status wasn't an object".into()) }
+    Ok(!status["TCP"][https.to_string()].is_null())
+}
+
+/// That HTTPS port no longer served; the rest of `tailscale serve` as it is. Bounded: Ctrl-C waits on it.
+pub fn serve_https_off(https: u16) -> Result<(), String> {
+    run_within(&["serve", &format!("--https={https}"), "off"], SERVE_WITHIN).map(|_| ())
 }
 
 /// Who is at `ip`, with five seconds for Tailscale to say.
@@ -290,6 +377,38 @@ pub fn pinged(output: &str) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_tailscale_behind_a_wrapper_still_times_out() {
+        // A script that doesn't exec it: the kill ends the shell, its child keeps the output open.
+        let began = Instant::now();
+        let said = answered_within(Command::new("/bin/sh").args(["-c", "echo started; /bin/sleep 10; true"]), "whois", Duration::from_millis(300));
+        assert!(said.as_ref().is_err_and(|why| why.starts_with("tailscale whois didn't answer")), "{said:?}");
+        assert!(began.elapsed() < Duration::from_secs(3), "{:?}", began.elapsed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_tailscale_printed_before_it_hung_is_said() {
+        // Also where a child of the wrapper holds the output open after the kill.
+        for script in ["echo enable HTTPS first; exec /bin/sleep 10", "echo enable HTTPS first; /bin/sleep 10; true", "echo enable HTTPS first >&2; /bin/sleep 10; true"] {
+            let said = answered_within(Command::new("/bin/sh").args(["-c", script]), "serve", Duration::from_millis(300));
+            assert!(said.as_ref().is_err_and(|why| why.contains("enable HTTPS first")), "{script}: {said:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapper_that_ended_isnt_waited_on_for_a_child_holding_its_output() {
+        // Both pipes held, or only the one whose text isn't used: not waited on for the time it was given.
+        for script in ["echo answered; /bin/sleep 5 & exit 0", "echo answered; /bin/sleep 5 >/dev/null & exit 0"] {
+            let began = Instant::now();
+            let said = answered_within(Command::new("/bin/sh").args(["-c", script]), "status", Duration::from_secs(3));
+            assert_eq!(said.as_deref().map(str::trim), Ok("answered"), "{script}");
+            assert!(began.elapsed() < Duration::from_millis(1500), "{script}: {:?}", began.elapsed());
+        }
+    }
 
     #[test]
     fn tailscale_is_given_a_term_only_where_there_is_none() {
@@ -396,4 +515,20 @@ mod tests {
         assert!(state_problem("Stopped").unwrap().contains("disconnected"));
         assert!(state_problem("Starting").unwrap().contains("Starting"));
     }
+    #[test]
+    fn serve_never_overwrites_a_port_or_an_unreadable_status() {
+        assert!(serve_port_free("{}", 8443).is_ok());
+        assert!(serve_port_free(r#"{"TCP":{"443":{"HTTPS":true}}}"#, 8443).is_ok());
+        assert!(serve_port_free(r#"{"TCP":{"8443":{"HTTPS":true}}}"#, 8443).unwrap_err().contains("served already"));
+        for out in ["", "not JSON", "null", "[]"] { assert!(serve_port_free(out, 8443).is_err()); }
+        assert_eq!(served(r#"{"TCP":{"8443":{"HTTPS":true}}}"#, 8443), Ok(true));
+        assert_eq!(served(r#"{"TCP":{"443":{"HTTPS":true}}}"#, 8443), Ok(false));
+        assert!(served("null", 8443).is_err());
+        let ours = r#"{"TCP":{"8443":{"HTTPS":true}},"Web":{"m.example.ts.net:8443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:5000"}}}}}"#;
+        assert_eq!(handed_to(ours, 8443, "http://127.0.0.1:5000"), Ok(true));
+        assert_eq!(handed_to(ours, 8443, "http://127.0.0.1:5001"), Ok(false));
+        assert_eq!(handed_to(&ours.replace(":8443\"", ":443\""), 8443, "http://127.0.0.1:5000"), Ok(false));
+        assert_eq!(handed_to("{}", 8443, "http://127.0.0.1:5000"), Ok(false));
+    }
+
 }

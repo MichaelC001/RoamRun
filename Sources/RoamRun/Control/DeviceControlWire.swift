@@ -1,4 +1,5 @@
 import CryptoKit
+import DeviceControl
 import Foundation
 
 /// How `roamrun look`, `tap` and the rest ask the app, which holds the connections: one JSON
@@ -13,9 +14,12 @@ enum DeviceControlWire {
         var x2: Double?
         var y2: Double?
         var milliseconds: Int?
+        /// For "pinch": how far apart the fingers end against where they began, and how far they turn (clockwise).
+        var scale: Double?
+        var degrees: Double?
         var text: String?
         var limit: Int?
-        /// For "tap", "swipe", "type" and "paste": the look the points or the text are held to, when
+        /// For "tap", "swipe", "pinch", "type" and "paste": the look the points or the text are held to, when
         /// the caller keeps it (the MCP tools do; a command run by hand is of whatever was looked at last).
         var look: Int?
         /// For "install_status": the install asked about, by the id "install" answered.
@@ -33,6 +37,8 @@ enum DeviceControlWire {
         var width: Int?
         var height: Int?
         var captions: [String]?
+        /// For "elements": each with what else is known of it; an older app sends only `captions`.
+        var elements: [ScreenElement]?
         var complete: Bool?
         /// For "state": whether the connection to the device stands.
         var open: Bool?
@@ -441,5 +447,12 @@ enum DeviceControlWire {
             close(fd)
             close(held) // last: until here nobody else makes the socket
         }
+    }
+}
+
+extension DeviceControlWire.Response {
+    /// For "elements": one line each, from an older app its caption alone.
+    var elementLines: [String]? {
+        elements?.map(\.line) ?? captions
     }
 }

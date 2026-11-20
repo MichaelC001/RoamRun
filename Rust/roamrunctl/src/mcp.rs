@@ -33,12 +33,13 @@ action, and points are pixels of the image the last look returned, given with th
 money, posts, sends, deletes or signs in unless the user asked for exactly that. A look shows whatever is on the screen \
 (notifications, messages); don't pass the image on. What an action itself brings up (paste's \"Allow Paste\") shows on the device. SHARING. Type and paste give the id of the latest look too, within a minute of it (after a tap with it is fine), and are refused once something else was looked at or done since: they go to whatever has focus. Press goes to whatever is on the screen: look before it too.";
 
-/// What the device shows of looks, for INSTRUCTIONS: a stream runs until about five seconds after the last look or action.
-fn instructions() -> String {
-    INSTRUCTIONS.replace("SHARING", if device::streams() {
-        "A look comes from the device's screen stream, which the device lists as screen sharing, where its user can see it, and some apps' sound goes silent, until about five seconds after the last look or action: asked to keep watching a screen, tell the user that first. Its picture is the display's own way up (on a device held sideways the screen may come turned), and points are pixels of it all the same. During a phone or VoIP call a look is slower"
-    } else {
-        "The device shows no screen-sharing session for looks"
+/// What the device shows of looks, for INSTRUCTIONS: a stream runs until about five seconds after the last look or action;
+/// in `view` (`in_view`), the stream its page shows, while anyone watches there.
+fn instructions(in_view: bool) -> String {
+    INSTRUCTIONS.replace("SHARING", match (device::streams(), in_view) {
+        (true, false) => "A look comes from the device's screen stream, which the device lists as screen sharing, where its user can see it, and some apps' sound goes silent, until about five seconds after the last look or action: asked to keep watching a screen, tell the user that first. Its picture is the display's own way up (on a device held sideways the screen may come turned), and points are pixels of it all the same. During a phone or VoIP call a look is slower",
+        (true, true) => "A look comes from the screen stream that roamrunctl view's browser page shows, which the device lists as screen sharing, where its user can see it, and some apps' sound goes silent, for as long as anyone watches that page, and otherwise until about five seconds after a look: asked to keep watching a screen, tell the user that first. Its picture is the display's own way up (on a device held sideways the screen may come turned), and points are pixels of it all the same. During a phone or VoIP call a look is slower",
+        (false, _) => "The device shows no screen-sharing session for looks",
     })
 }
 
@@ -100,13 +101,39 @@ pub fn upright(way: u8, sideways: bool, (x, y): (f64, f64)) -> Option<(f64, f64)
 /// Width and height, in pixels.
 type Size = (u32, u32);
 
+/// What the pages of `view` did on the device it shares with this server: each input counted as it begins, and when
+/// the last one ended. A look is then not taken to show the screen as it is.
+#[derive(Default)]
+pub struct PageInputs {
+    pub count: std::sync::atomic::AtomicU64,
+    pub ended: std::sync::Mutex<Option<Instant>>,
+    /// Held by a page's input while it runs, and by an agent's from judging its look to acting: none comes between.
+    pub gate: std::sync::Mutex<()>,
+}
+
+/// Where a look takes its picture instead of asking the device for one (`view --mcp`: view's own stream).
+pub type Pictures = Box<dyn Fn() -> Result<(device::Picture, Instant), String> + Send>;
+
+/// Told of each tap and swipe an agent made, in the device's upright terms (0…1): `view --mcp` shows it on its pages.
+pub type Seen = Box<dyn Fn(&str, &[(f64, f64)]) + Send>;
+
+/// Whether the caller of the call that runs went meanwhile (`view --mcp`: its connection closed).
+pub type Gone = Box<dyn Fn() -> bool + Send>;
+
+/// What the library says of a tunnel that closed (the device unplugged, or it let the connection go).
+pub const GONE: &str = "adapter closed";
+
+/// A page's input this short a time before a look's picture may not be in it yet (the picture comes late).
+const PAGE_SHOWN: Duration = Duration::from_millis(500);
+
 /// A device offered over HTTP by its name, with its saved file as it was then (see `device::mark`).
 pub type Offered = (String, Option<Vec<u8>>);
 
 #[derive(Default)]
 pub struct Server {
     /// Each with its saved file as it was when it was opened: a name saved anew since isn't this device.
-    open: HashMap<String, crate::device::Held>,
+    /// Shared, so that `view --mcp` can hand over the device it streams from.
+    open: HashMap<String, (Arc<Device>, Option<Vec<u8>>)>,
     shown: HashMap<String, Shown>,
     acted: HashMap<String, Instant>,
     /// Over HTTP (`mcp --http`): the devices named there, each with its saved file as it was then (see
@@ -124,6 +151,17 @@ pub struct Server {
     /// asked again when frames come in another size (a two-screen device folded or opened since), and, not said, a
     /// minute later.
     screens: HashMap<String, (Size, Option<Size>, Instant)>,
+    /// `view --mcp`: the one device is view's own connection, held for good. It is never opened again nor let go of
+    /// (another connection would start a second screen stream, which stops view's), and no saved file is asked
+    /// after (the connection is the device).
+    pinned: bool,
+    /// `view --mcp`: what its pages do on the device, and the count each device's latest look began at.
+    page: Option<Arc<PageInputs>>,
+    looked_page: HashMap<String, u64>,
+    /// `view --mcp`: a look's picture from view's stream; where none comes, the device is asked as ever.
+    pictures: Option<Pictures>,
+    seen: Option<Seen>,
+    gone: Option<Gone>,
 }
 
 fn text(s: impl Into<String>) -> Vec<Value> { vec![json!({ "type": "text", "text": s.into() })] }
@@ -154,7 +192,7 @@ pub fn begun(what: &str, megabytes: u64, name: &str, id: &str, given: Duration) 
 /// can't be undone from here (`lock`), ends an app, or replaces one.
 fn hints(name: &str) -> Value {
     let reads = matches!(name, "devices" | "look" | "install_status");
-    let destroys = matches!(name, "tap" | "swipe" | "type" | "paste" | "press" | "install" | "launch");
+    let destroys = matches!(name, "tap" | "swipe" | "pinch" | "type" | "paste" | "press" | "install" | "launch");
     json!({ "readOnlyHint": reads, "destructiveHint": destroys })
 }
 
@@ -165,12 +203,18 @@ fn tools(remote: bool, installs: bool) -> Value {
     let since = json!({ "type": "integer", "description": "The id of the device's latest look, less than a minute old, with no other look, button, launch, install or elements since (taps, swipes, types and pastes by it are fine)" });
     let all = json!([
         tool("devices", "The devices this machine can use, one a line: its name, a tab, and how it is kept (one sentence where there is none). One \"not used here yet\" is offered by another machine and believed the first time it is used: use it only if the user named it.", json!({}), &[]),
-        tool("look", "The device's screen now, as an image, and the look's id. Do this before every tap or swipe: it serves one action, which gives that id.", json!({}), &[]),
+        tool("look", "The device's screen now, as an image, and the look's id. Do this before every tap, swipe or pinch: it serves one action, which gives that id.", json!({}), &[]),
         tool("tap", "Tap a point of the last look. Operates the device: whatever is there gets pressed.", json!({ "look": look, "x": point, "y": point }), &["look", "x", "y"]),
         tool("swipe", "Drag from one point of the last look to another (to scroll, or move something). Operates the device.",
              json!({ "look": look, "x1": point, "y1": point, "x2": point, "y2": point, "milliseconds": { "type": "integer", "description": "How long the drag takes (50...5000, default 300)" } }),
              &["look", "x1", "y1", "x2", "y2"]),
-        tool("elements", "What accessibility says is on the screen, one caption a line (\"Home, tab, selected\"). No positions: find a caption in a look to tap it. The screen may scroll to what is visited. Nothing on the home screen.",
+        tool("pinch", "Two fingers about a point of the last look, moving apart or together and turning, then lifted: scale 2 zooms in, 0.5 out; degrees turn them (clockwise). Neither: a two-finger tap. A finger that would leave the screen is refused. Operates the device.",
+             json!({ "look": look, "x": point, "y": point,
+                     "scale": { "type": "number", "description": "How far apart the fingers end, against where they began (0.25...4, default 1)" },
+                     "degrees": { "type": "number", "description": "How far they turn, clockwise (-180...180, default 0)" },
+                     "milliseconds": { "type": "integer", "description": "How long it takes (50...5000, default 500)" } }),
+             &["look", "x", "y"]),
+        tool("elements", "What accessibility says is on the screen, one element a line: its caption (\"Home, tab, selected\"), then \" — id: \" and its accessibility identifier when the app set one. No positions: find a caption in a look to tap it. The screen may scroll to what is visited. Nothing on the home screen.",
              json!({ "limit": { "type": "integer", "description": "How many at most (default 40)" } }), &[]),
         tool("type", "Type text on the device's keyboard, into whatever has its focus. US-keyboard characters only; a newline is Return. Right only while the device's keyboard is an English one — look first: under a Japanese one keys go to its conversion. 500 characters at most.",
              json!({ "look": since, "text": { "type": "string" } }), &["look", "text"]),
@@ -193,6 +237,15 @@ fn tools(remote: bool, installs: bool) -> Value {
     Value::Array(all.as_array().into_iter().flatten().filter(|t| !remote || installs || !t["name"].as_str().is_some_and(|n| n.starts_with("install"))).cloned().collect())
 }
 
+/// An element as a line: its caption, then its identifier if it has one. The same in `roamrun mcp`.
+fn element_line(element: &Value) -> Option<String> {
+    let caption = element["caption"].as_str()?;
+    Some(match element["identifier"].as_str() {
+        Some(id) => format!("{caption} — id: {id}"),
+        None => caption.to_string(),
+    })
+}
+
 /// Over HTTP, of an offered device removed, or another saved under its name, since the server began.
 fn anew(name: &str) -> String {
     format!("{name} was removed here, or saved anew, since this began: it isn't used. To offer it again, end this and run it again")
@@ -210,6 +263,14 @@ fn look_of(arguments: &Value) -> Result<u64, String> {
     if given.is_null() { return Err("look is missing: give the id the last look answered with".into()) }
     given.as_u64().or_else(|| given.as_str()?.trim().parse().ok())
         .ok_or_else(|| "look isn't a look's id: give the id the last look answered with, a whole number".to_string())
+}
+
+/// A swipe's or a pinch's length, `default` when not given.
+fn milliseconds(arguments: &Value, default: u32) -> Result<u32, String> {
+    match &arguments["milliseconds"] {
+        Value::Null => Ok(default),
+        given => Ok(given.as_u64().filter(|ms| (50..=5000).contains(ms)).ok_or("milliseconds is a whole number, 50...5000")? as u32),
+    }
 }
 
 /// Whether the call `line` asks for was taken back by a message that came after it (notifications/cancelled):
@@ -231,6 +292,37 @@ impl Server {
     /// only from `uploads` (`--allow-install`).
     pub fn offering(offered: Vec<Offered>, uploads: Option<Arc<Uploads>>) -> Server {
         Server { offered: Some(offered), uploads, ..Server::default() }
+    }
+
+    /// For `view --mcp`: `device`, view's own, under `name` alone; no install.
+    pub fn holding(name: &str, device: Arc<Device>, page: Option<Arc<PageInputs>>) -> Server {
+        let mut server = Server::offering(vec![(name.to_string(), None)], None);
+        server.open.insert(name.to_string(), (device, None));
+        server.pinned = true;
+        server.page = page;
+        server
+    }
+
+    /// For `view --mcp`: looks take their picture from `pictures` first.
+    pub fn take_pictures(&mut self, pictures: Pictures) { self.pictures = Some(pictures) }
+
+    /// For `view --mcp`: each tap and swipe made is told to `seen`.
+    pub fn tell(&mut self, seen: Seen) { self.seen = Some(seen) }
+
+    /// For `view --mcp`: the next calls ask `gone` whether their caller went, once they have waited for a page's input.
+    pub fn ask_gone(&mut self, gone: Option<Gone>) { self.gone = gone }
+
+    /// A held device whose connection is gone (its tunnel closed: unplugged, or the device let it go) is said to be,
+    /// with what to do: it isn't opened again here.
+    fn gone(&self, why: String) -> String {
+        if self.pinned && why.contains(GONE) { format!("view's connection to the device is gone ({why}): start view again, with the device connected") } else { why }
+    }
+
+    /// Whether a page acted on the device since the look began, or so shortly before its picture that it may not show.
+    fn page_since(&self, name: &str, picture: Instant) -> bool {
+        let Some(page) = &self.page else { return false };
+        let ended = *page.ended.lock().unwrap_or_else(|e| e.into_inner());
+        self.looked_page.get(name) != Some(&page.count.load(std::sync::atomic::Ordering::SeqCst)) || ended.is_some_and(|ended| ended + PAGE_SHOWN > picture)
     }
 
     fn next_look(&mut self) -> u64 {
@@ -292,11 +384,11 @@ impl Server {
                 "protocolVersion": VERSIONS.into_iter().find(|v| params["protocolVersion"] == *v).or(VERSIONS.into_iter().max()),
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "roamrunctl", "version": env!("ROAMRUN_VERSION") },
-                "instructions": instructions(),
+                "instructions": instructions(self.page.is_some()),
             }),
             "ping" => json!({}),
             "tools/list" => json!({ "tools": tools(self.offered.is_some(), self.uploads.is_some()) }),
-            "tools/call" => match self.call(params["name"].as_str().unwrap_or(""), &params["arguments"]) {
+            "tools/call" => match self.call(params["name"].as_str().unwrap_or(""), &params["arguments"]).map_err(|why| self.gone(why)) {
                 Ok(content) => json!({ "content": content, "isError": false }),
                 Err(why) => json!({ "content": text(why), "isError": true }),
             },
@@ -316,6 +408,7 @@ impl Server {
     /// since (while a look waited for the screen, say): before it is opened, and by what it was opened from. `by`:
     /// for a tap, swipe, type or paste, the saved file of the look it goes by, held to as an offered one is.
     fn device(&mut self, name: &str, by: Option<&Option<Vec<u8>>>) -> Result<&Device, String> {
+        if self.pinned { return self.open.get(name).map(|(device, _)| &**device).ok_or_else(|| format!("{name} isn't offered here")) }
         // Removed since, or another saved under the name: the one that is open isn't the one named any more.
         if self.open.get(name).is_some_and(|(_, was)| device::mark(name) != *was) {
             // What was seen of the other isn't this one's screen.
@@ -329,7 +422,7 @@ impl Server {
             let held = if offered.is_some() { device::held_here(name)?.ok_or_else(|| anew(name))? } else { device::held(name)? };
             if offered.as_ref().is_some_and(|was| held.1 != *was) { return Err(anew(name)) }
             if by.is_some_and(|by| held.1 != *by) { return Err(OF_ANOTHER.into()) }
-            self.open.insert(name.to_string(), held);
+            self.open.insert(name.to_string(), (Arc::new(held.0), held.1));
         }
         Ok(&self.open[name].0)
     }
@@ -352,7 +445,10 @@ impl Server {
         }
         self.acted.insert(name.to_string(), Instant::now());
         let said = device::said(raw);
-        if said.is_err() { self.open.remove(name); self.shown.remove(name); }
+        if said.is_err() {
+            if !self.pinned { self.open.remove(name); }
+            self.shown.remove(name);
+        }
         said.map_err(|why| format!("{why}. It may or may not have reached the device: look before doing it again"))
     }
 
@@ -362,7 +458,9 @@ impl Server {
         let Some(shown) = self.shown.get(name) else { return Ok(()) };
         let why = if shown.at.elapsed() > LOOK_STANDS {
             "that look is more than a minute old: look again"
-        } else if device::mark(name) != shown.of {
+        } else if self.page_since(name, shown.at) {
+            "the screen was used from view's page since that look: look again"
+        } else if !self.pinned && device::mark(name) != shown.of {
             OF_ANOTHER
         } else {
             return Ok(());
@@ -378,7 +476,9 @@ impl Server {
 
     /// An input just made on the device: the screen is given what is left of a moment to settle (see `SETTLE`).
     fn settle(&self, name: &str) {
-        if let Some(wait) = self.acted.get(name).and_then(|at| SETTLE.checked_sub(at.elapsed())) { std::thread::sleep(wait); }
+        let page = self.page.as_ref().and_then(|page| *page.ended.lock().unwrap_or_else(|e| e.into_inner()));
+        let last = self.acted.get(name).copied().into_iter().chain(page).max();
+        if let Some(wait) = last.and_then(|at| SETTLE.checked_sub(at.elapsed())) { std::thread::sleep(wait); }
     }
 
     fn call(&mut self, tool: &str, arguments: &Value) -> Result<Vec<Value>, String> {
@@ -386,7 +486,8 @@ impl Server {
             // Those offered are saved here: no machine that might sign is asked.
             let Some(offered) = &self.offered else { return device::listed(true).map(text) };
             // One removed, or saved anew, since it was offered isn't used: not listed either.
-            let names: Vec<String> = offered.iter().filter(|(name, was)| device::mark(name) == *was).map(|(name, _)| name.clone()).collect();
+            let names: Vec<String> = offered.iter().filter(|(name, was)| self.pinned || device::mark(name) == *was).map(|(name, _)| name.clone()).collect();
+            if self.pinned { return Ok(text(names.join("\n"))) }
             return Ok(text(if names.is_empty() { "No device offered here can be used now.".to_string() } else { device::lines(&names, &[]) }));
         }
         let name = arguments["device"].as_str().ok_or("device is missing")?.to_string();
@@ -395,7 +496,7 @@ impl Server {
                 return Err(format!("{name} isn't offered here: {}", offered.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(", ")));
             };
             // Removed, or another saved under the name, since this began: not the device that was offered.
-            if device::mark(&name) != *was { return Err(anew(&name)) }
+            if !self.pinned && device::mark(&name) != *was { return Err(anew(&name)) }
             if tool.starts_with("install") && self.uploads.is_none() { return Err("install isn't offered here: this was started without --allow-install".into()) }
         }
         if tool == "install_status" { return self.install_status(&name, arguments["install"].as_str()).map(text) }
@@ -409,16 +510,33 @@ impl Server {
         }
         let number = |key: &str| arguments[key].as_f64().ok_or(format!("{key} is missing"));
         let word = |key: &str| arguments[key].as_str().map(str::to_string).ok_or("nothing to send".to_string());
+        // A page's input waits for this, and this for one running (see `PageInputs::gate`).
+        let page = self.page.clone();
+        let turn = page.as_deref().filter(|_| matches!(tool, "tap" | "swipe" | "pinch" | "type" | "paste" | "press" | "launch" | "elements"))
+            .map(|page| page.gate.lock().unwrap_or_else(|e| e.into_inner()));
+        if turn.is_some() && self.gone.as_ref().is_some_and(|gone| gone()) { return Err("not made: its caller went while a page's input ran".into()) }
         match tool {
             "look" => {
                 // A look that fails leaves none to act by: what an earlier one saw may have moved meanwhile.
                 self.shown.remove(&name);
+                if let Some(page) = &self.page { self.looked_page.insert(name.clone(), page.count.load(std::sync::atomic::Ordering::SeqCst)); }
                 self.settle(&name);
                 self.device(&name, None)?;
                 let of = self.open[&name].1.clone();
                 let device = &self.open[&name].0;
-                let picture = match device::picture(device) {
+                // From view's stream where it gives one; else the device is asked, and the look says why.
+                // With view's page, the device's picture is taken as of when it was asked for: a page's input just before
+                // isn't in it yet.
+                let asked = Instant::now();
+                // Where view's stream gave none, the PNG: asking the device for a key frame would start a stream of its own.
+                let (taken, aside, captured) = match self.pictures.as_ref().map(|pictures| pictures()) {
+                    Some(Ok((picture, at))) => (Ok(picture), None, at),
+                    Some(Err(why)) => { let asked = Instant::now(); (device::screenshot(device), Some(why), asked) }
+                    None => (device::picture(device), None, asked),
+                };
+                let picture = match taken {
                     Ok(picture) => picture,
+                    Err(why) if self.pinned => return Err(match &aside { Some(stream) => format!("{why} (and from view's stream: {stream})"), None => why }),
                     Err(_) => {
                         // Let go of meanwhile: once more, on a new connection.
                         self.open.remove(&name);
@@ -447,14 +565,15 @@ impl Server {
                 let way = if native { 1 } else { match device.way() { 0 => device.way(), way => way } };
                 let (jpeg, width, height) = device::fitted(picture.image, image::ImageFormat::Jpeg)?;
                 let id = self.next_look();
-                self.shown.insert(name, Shown { size: (width as f64, height as f64), way, native, at: Instant::now(), of, id, spent: false });
+                self.shown.insert(name, Shown { size: (width as f64, height as f64), way, native, at: if self.page.is_some() { captured } else { Instant::now() }, of, id, spent: false });
                 let mut content = vec![json!({ "type": "image", "data": base64::engine::general_purpose::STANDARD.encode(jpeg), "mimeType": "image/jpeg" })];
                 // Said, so that a look much slower than the last isn't a mystery.
                 let png = if streamed && !native { " (The device's PNG: the screen stream's frame couldn't be cut to the screen, or the device didn't say its size.)" } else { "" };
-                content.extend(text(format!("{width} x {height}, look {id}. Points for tap and swipe are pixels of this image, given with look {id}. It serves one tap or swipe, and type and paste, within a minute: look again after them.{png}")));
+                let aside = aside.map(|why| format!(" (Not from view's stream: {why}.)")).unwrap_or_default();
+                content.extend(text(format!("{width} x {height}, look {id}. Points for tap, swipe and pinch are pixels of this image, given with look {id}. It serves one tap, swipe or pinch, and type and paste, within a minute: look again after them.{png}{aside}")));
                 Ok(content)
             }
-            "tap" | "swipe" => {
+            "tap" | "swipe" | "pinch" => {
                 // The look is spent by what reaches the device: a call refused for what it says leaves it.
                 let before = self.shown.get(&name).filter(|shown| !shown.spent).ok_or("look first: a point is given in the pixels of the image a look returns")?.clone();
                 let (id, size, way, native, of) = (before.id, before.size, before.way, before.native, before.of.clone());
@@ -478,16 +597,25 @@ impl Server {
                     let (x, y) = real(number("x")?, number("y")?)?;
                     self.spend(&name);
                     if !native { self.unturned(&name, way, &of)?; }
-                    self.ask(&name, Some(&of), Some(before), |d| d.tap(x, y)).map(|_| "tapped; look to see what it did")
-                } else {
+                    let done = self.ask(&name, Some(&of), Some(before), |d| d.tap(x, y)).map(|_| "tapped; look to see what it did");
+                    if let (Ok(_), Some(seen)) = (&done, &self.seen) { seen("tap", &[(x, y)]) }
+                    done
+                } else if tool == "swipe" {
                     let (from, to) = (real(number("x1")?, number("y1")?)?, real(number("x2")?, number("y2")?)?);
-                    let ms = match &arguments["milliseconds"] {
-                        Value::Null => 300,
-                        given => given.as_u64().filter(|ms| (50..=5000).contains(ms)).ok_or("milliseconds is a whole number, 50...5000")? as u32,
-                    };
+                    let ms = milliseconds(arguments, 300)?;
                     self.spend(&name);
                     if !native { self.unturned(&name, way, &of)?; }
-                    self.ask(&name, Some(&of), Some(before), |d| d.swipe(from, to, ms)).map(|_| "swiped; look to see what it did")
+                    let done = self.ask(&name, Some(&of), Some(before), |d| d.swipe(from, to, ms)).map(|_| "swiped; look to see what it did");
+                    if let (Ok(_), Some(seen)) = (&done, &self.seen) { seen("swipe", &[from, to]) }
+                    done
+                } else {
+                    let centre = real(number("x")?, number("y")?)?;
+                    let or = |key: &str, default: f64| if arguments[key].is_null() { Ok(default) } else { number(key) };
+                    let (scale, degrees, ms) = (or("scale", 1.0)?, or("degrees", 0.0)?, milliseconds(arguments, 500)?);
+                    // Turned as the look was, clockwise there is clockwise held upright: the degrees go as they are.
+                    self.spend(&name);
+                    if !native { self.unturned(&name, way, &of)?; }
+                    self.ask(&name, Some(&of), Some(before), |d| d.pinch(centre, scale, degrees, ms)).map(|_| "pinched; look to see what it did")
                 };
                 done.map(text)
             }
@@ -495,9 +623,9 @@ impl Server {
                 self.shown.remove(&name);   // the walk can scroll the screen
                 let limit = arguments["limit"].as_u64().unwrap_or(40) as u32;
                 let said = self.ask(&name, None, None, |d| d.elements(limit))?;
-                let captions: Vec<&str> = said["elements"].as_array().map(|all| all.iter().filter_map(|e| e["caption"].as_str()).collect()).unwrap_or_default();
-                let more = if said["complete"] == true { String::new() } else { format!("\n({} elements; the walk was cut short, there may be more)", captions.len()) };
-                Ok(text(captions.join("\n") + &more))
+                let lines: Vec<String> = said["elements"].as_array().map(|all| all.iter().filter_map(element_line).collect()).unwrap_or_default();
+                let more = if said["complete"] == true { String::new() } else { format!("\n({} elements; the walk was cut short, there may be more)", lines.len()) };
+                Ok(text(lines.join("\n") + &more))
             }
             "type" | "paste" | "press" => {
                 let value = word(if tool == "press" { "button" } else { "text" })?;
@@ -616,6 +744,13 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn an_element_is_its_caption_then_its_identifier() {
+        assert_eq!(element_line(&json!({ "caption": "General, button" })).as_deref(), Some("General, button"));
+        assert_eq!(element_line(&json!({ "caption": "Bluetooth, button", "identifier": "com.apple.settings.bluetooth" })).as_deref(), Some("Bluetooth, button — id: com.apple.settings.bluetooth"));
+        assert_eq!(element_line(&json!({ "identifier": "x" })), None);
+    }
+
+    #[test]
     fn a_point_is_turned_back_to_the_device_held_upright() {
         assert_eq!(upright(1, false, (0.25, 0.1)), Some((0.25, 0.1)));
         assert_eq!(upright(2, false, (0.25, 0.1)), Some((0.75, 0.9)));
@@ -627,6 +762,37 @@ pub(crate) mod tests {
         // Said one way and shaped the other (turned in between): not pressed.
         assert!(turned(1, 3) && !turned(1, 1) && !turned(0, 3) && !turned(3, 0));
         assert_eq!((upright(1, true, (0.25, 0.1)), upright(3, false, (0.25, 0.1))), (None, None));
+    }
+
+    /// A pinch's degrees go to the device as they are: clockwise in a look turned any way is clockwise held upright.
+    #[test]
+    fn a_turn_in_a_look_is_the_same_turn_held_upright() {
+        let held = (1179.0, 2556.0);
+        for way in 1..=4u8 {
+            let sideways = way >= 3;
+            let look = if sideways { (held.1, held.0) } else { held };
+            // From the centre, a point to the right and one turned 30° clockwise from it (y going down), in the look's pixels.
+            let [c, a, b] = [(0.5, 0.5), (0.6, 0.5), (0.5 + 0.1 * 30f64.to_radians().cos(), 0.5 + 0.1 * 30f64.to_radians().sin() * look.0 / look.1)];
+            let px = |p: (f64, f64)| { let (x, y) = upright(way, sideways, p).unwrap(); (x * held.0, y * held.1) };
+            let (c, a, b) = (px(c), px(a), px(b));
+            let (u, v) = ((a.0 - c.0, a.1 - c.1), (b.0 - c.0, b.1 - c.1));
+            let turn = (u.0 * v.1 - u.1 * v.0).atan2(u.0 * v.0 + u.1 * v.1).to_degrees();
+            assert!((turn - 30.0).abs() < 0.01, "way {way}: {turn}");
+        }
+    }
+
+    #[test]
+    fn in_view_an_agent_is_told_the_stream_lasts_while_the_page_is_watched() {
+        let said = |page: Option<Arc<PageInputs>>| {
+            let hello: Value = serde_json::from_str(&Server::holding("usb", Arc::new(Device::none()), page).handle(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#).unwrap()).unwrap();
+            hello["result"]["instructions"].as_str().unwrap_or_default().to_string()
+        };
+        let (alone, in_view) = (said(None), said(Some(Arc::new(PageInputs::default()))));
+        // Where looks are the device's PNG (off macOS, ROAMRUNCTL_LOOK=screenshot), both say none is shown.
+        if !device::streams() { return assert_eq!(alone, in_view) }
+        assert!(alone.contains("about five seconds after the last look") && !alone.contains("view"), "{alone}");
+        assert!(in_view.contains("for as long as anyone watches that page") && !in_view.contains("after the last look or action"), "{in_view}");
+        assert!(in_view.contains("tell the user that first"), "{in_view}");
     }
 
     #[test]
@@ -651,7 +817,7 @@ pub(crate) mod tests {
         }
         let listed: Value = serde_json::from_str(&server.handle(r#"{"jsonrpc":"2.0","id":"a","method":"tools/list"}"#).unwrap()).unwrap();
         let names: Vec<&str> = listed["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["devices", "look", "tap", "swipe", "elements", "type", "paste", "press", "install", "install_status", "launch"]);
+        assert_eq!(names, ["devices", "look", "tap", "swipe", "pinch", "elements", "type", "paste", "press", "install", "install_status", "launch"]);
         assert_eq!(listed["id"], "a");
         // Every tool but `devices` names its device, and says whether it only reads.
         for t in listed["result"]["tools"].as_array().unwrap() {
@@ -659,7 +825,7 @@ pub(crate) mod tests {
         }
         let hinted = |hint: &str| -> Vec<&str> { listed["result"]["tools"].as_array().unwrap().iter().filter(|t| t["annotations"][hint] == true).map(|t| t["name"].as_str().unwrap()).collect() };
         assert_eq!(hinted("readOnlyHint"), ["devices", "look", "install_status"]);
-        assert_eq!(hinted("destructiveHint"), ["tap", "swipe", "type", "paste", "press", "install", "launch"]);
+        assert_eq!(hinted("destructiveHint"), ["tap", "swipe", "pinch", "type", "paste", "press", "install", "launch"]);
         // A notification gets no answer; an unknown method gets an error with its id.
         assert!(server.handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
         let garbled: Value = serde_json::from_str(&server.handle("not json").unwrap()).unwrap();
@@ -701,7 +867,7 @@ pub(crate) mod tests {
         // A tap, swipe, type or paste gives look 7 unless it says another.
         let call = |server: &mut Server, tool: &str, mut arguments: Value| -> String {
             arguments["device"] = json!(name);
-            if matches!(tool, "tap" | "swipe" | "type" | "paste") && arguments["look"].is_null() { arguments["look"] = json!(7) }
+            if matches!(tool, "tap" | "swipe" | "pinch" | "type" | "paste") && arguments["look"].is_null() { arguments["look"] = json!(7) }
             server.call(tool, &arguments).err().unwrap_or_else(|| "done".into())
         };
         let look = |server: &mut Server, size, way, at| {
@@ -713,6 +879,9 @@ pub(crate) mod tests {
         look(&mut server, upright, 1, now());
         assert!(call(&mut server, "tap", json!({ "x": 100, "y": 1 })).contains("inside the image"));
         assert!(call(&mut server, "swipe", json!({ "x1": 1, "y1": 1, "x2": 2, "y2": 2, "milliseconds": 10 })).contains("50...5000"));
+        assert!(call(&mut server, "pinch", json!({ "x": 50, "y": 100, "milliseconds": 6000 })).contains("50...5000"));
+        assert!(call(&mut server, "pinch", json!({ "x": 50, "y": 300 })).contains("inside the image"));
+        assert!(call(&mut server, "pinch", json!({ "x": 50, "y": 100, "scale": "2" })).contains("scale is missing"));
         assert!(call(&mut server, "type", json!({ "text": "a".repeat(501) })).starts_with("too long"));
         assert!(server.shown.contains_key(&name));
         // Sent, it is spent — though the device didn't answer.
@@ -1059,5 +1228,112 @@ pub(crate) mod tests {
         assert!(uploads.check(&id, "n1", &sha256).is_ok());
         device::unstub(&name);
         uploads.end();
+    }
+
+    /// view's device, held for good: a call that fails leaves it held (no second connection is ever opened, which
+    /// would start a second screen stream), the next call reaches it again, no install is offered, and `devices` names
+    /// it alone, though no device is saved under that name.
+    #[test]
+    fn a_held_device_is_never_let_go_of_nor_opened_anew() {
+        let mut server = Server::holding("usb", Arc::new(Device::none()), None);
+        assert!(server.call("look", &json!({ "device": "usb" })).is_err());
+        assert!(server.open.contains_key("usb"));
+        assert!(server.call("look", &json!({ "device": "usb" })).is_err());
+        assert!(server.open.contains_key("usb"));
+        assert!(server.call("tap", &json!({ "device": "usb", "look": 1, "x": 1, "y": 1 })).unwrap_err().contains("look first"));
+        assert!(server.call("install", &json!({ "device": "usb", "path": "/tmp" })).unwrap_err().contains("install isn't offered"));
+        assert!(server.call("look", &json!({ "device": "other" })).unwrap_err().contains("isn't offered here"));
+        assert_eq!(server.call("devices", &json!({})).unwrap()[0]["text"], "usb");
+        assert!(!tools(true, false).to_string().contains("\"install\""));
+        // Its tunnel closed (unplugged overnight, seen): said so, and what to do.
+        assert!(server.gone(format!("display service: Socket({GONE})")).contains("start view again"));
+        assert!(!Server::default().gone(format!("x {GONE}")).contains("start view again"));
+    }
+
+    /// A look isn't acted by once view's page acted on the device since it began, or so shortly before its picture
+    /// that the picture may not show it; one older than that stands.
+    #[test]
+    fn a_look_is_spent_by_what_the_page_did() {
+        let page = Arc::new(PageInputs::default());
+        let mut server = Server::holding("usb", Arc::new(Device::none()), Some(page.clone()));
+        let looked = |server: &mut Server, at: Instant| {
+            server.looked_page.insert("usb".into(), page.count.load(std::sync::atomic::Ordering::SeqCst));
+            server.shown.insert("usb".into(), Shown { size: (100.0, 200.0), way: 1, native: true, at, of: None, id: 7, spent: false });
+        };
+        let tap = json!({ "device": "usb", "look": 7, "x": 10, "y": 10 });
+        looked(&mut server, Instant::now());
+        page.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(server.call("tap", &tap).unwrap_err().contains("used from view's page"));
+        // The count as at the look, but the page's input ended just before its picture.
+        *page.ended.lock().unwrap() = Some(Instant::now());
+        looked(&mut server, Instant::now());
+        assert!(server.call("type", &json!({ "device": "usb", "look": 7, "text": "a" })).unwrap_err().contains("used from view's page"));
+        // Ended well before the picture: the look stands, and the tap goes to the device (none here).
+        *page.ended.lock().unwrap() = Some(Instant::now() - Duration::from_secs(5));
+        looked(&mut server, Instant::now());
+        assert!(!server.call("tap", &tap).unwrap_err().contains("used from view's page"));
+    }
+
+    /// A page's input running when an agent acts by a look taken meanwhile: the action waits for it to end, and is then
+    /// refused, not made after it.
+    #[test]
+    fn an_agents_action_waits_for_a_page_input_running() {
+        let page = Arc::new(PageInputs::default());
+        let mut server = Server::holding("usb", Arc::new(Device::none()), Some(page.clone()));
+        let (began, running) = std::sync::mpsc::channel();
+        let input = page.clone();
+        let page_input = std::thread::spawn(move || {
+            let _turn = input.gate.lock().unwrap();
+            input.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            began.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            *input.ended.lock().unwrap() = Some(Instant::now());
+        });
+        running.recv().unwrap();
+        // Looked at while it runs: counted as begun, not yet ended.
+        server.looked_page.insert("usb".into(), page.count.load(std::sync::atomic::Ordering::SeqCst));
+        server.shown.insert("usb".into(), Shown { size: (100.0, 200.0), way: 1, native: true, at: Instant::now(), of: None, id: 7, spent: false });
+        assert!(server.call("tap", &json!({ "device": "usb", "look": 7, "x": 10, "y": 10 })).unwrap_err().contains("used from view's page"));
+        page_input.join().unwrap();
+    }
+
+    #[test]
+    fn a_slow_look_keeps_the_frames_time_for_page_inputs() {
+        let page = Arc::new(PageInputs::default());
+        let mut server = Server::holding("usb", Arc::new(Device::none()), Some(page.clone()));
+        let captured = Instant::now() - Duration::from_secs(3);
+        *page.ended.lock().unwrap() = Some(captured + Duration::from_secs(1));
+        server.take_pictures(Box::new(move || Ok((device::Picture {
+            image: image::DynamicImage::new_rgb8(100, 200), native: false,
+        }, captured))));
+        server.call("look", &json!({ "device": "usb" })).unwrap();
+        let id = server.shown["usb"].id;
+        assert!(server.call("tap", &json!({ "device": "usb", "look": id, "x": 10, "y": 10 })).unwrap_err().contains("used from view's page"));
+    }
+
+    /// A call whose caller went while it waited behind a page's input isn't made; one with its caller still there is.
+    #[test]
+    fn a_call_whose_caller_went_behind_a_page_input_isnt_made() {
+        let page = Arc::new(PageInputs::default());
+        let mut server = Server::holding("usb", Arc::new(Device::none()), Some(page.clone()));
+        server.ask_gone(Some(Box::new(|| true)));
+        assert!(server.call("press", &json!({ "device": "usb", "button": "home" })).unwrap_err().contains("its caller went"));
+        // Those that wait for the device as a page's input does, without a look.
+        assert!(server.call("launch", &json!({ "device": "usb", "bundle_id": "com.example.app" })).unwrap_err().contains("its caller went"));
+        assert!(server.call("elements", &json!({ "device": "usb" })).unwrap_err().contains("its caller went"));
+        server.ask_gone(Some(Box::new(|| false)));
+        assert!(!server.call("press", &json!({ "device": "usb", "button": "home" })).unwrap_err().contains("its caller went"));
+    }
+
+    /// Only what reached the device is told to the watchers: a tap the device didn't take isn't.
+    #[test]
+    fn a_failed_tap_isnt_shown() {
+        let told = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut server = Server::holding("usb", Arc::new(Device::none()), None);
+        let count = told.clone();
+        server.tell(Box::new(move |_, _| { count.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }));
+        server.shown.insert("usb".into(), Shown { size: (100.0, 200.0), way: 1, native: true, at: Instant::now(), of: None, id: 7, spent: false });
+        assert!(server.call("tap", &json!({ "device": "usb", "look": 7, "x": 10, "y": 10 })).is_err());
+        assert_eq!(told.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

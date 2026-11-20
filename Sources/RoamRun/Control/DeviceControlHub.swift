@@ -56,9 +56,10 @@ protocol ControlledDevice: AnyObject, Sendable {
     func gate(_ mayBegin: @escaping @Sendable () -> Bool)
     func close()
     func look() throws -> CGImage
-    func elements(limit: Int) throws -> (captions: [String], complete: Bool)
+    func elements(limit: Int) throws -> (elements: [ScreenElement], complete: Bool)
     func tap(x: Double, y: Double) throws
     func swipe(from: (x: Double, y: Double), to: (x: Double, y: Double), milliseconds: Int) throws
+    func pinch(at centre: (x: Double, y: Double), scale: Double, degrees: Double, milliseconds: Int) throws
     func type(_ text: String) throws
     func paste(_ text: String) throws
     func press(_ button: String) throws
@@ -1116,6 +1117,11 @@ final class DeviceControlHub: @unchecked Sendable {
         return (50 ... 5000).contains(asked) ? asked : nil
     }
 
+    /// The same for a pinch, 500 ms when not asked.
+    static func pinchDuration(_ asked: Int?) -> Int? {
+        asked == nil ? 500 : swipeDuration(asked)
+    }
+
     static func isLookFile(_ path: String, in directory: URL) -> Bool {
         let file = URL(fileURLWithPath: path).standardizedFileURL
         return file.deletingLastPathComponent().path == DeviceControlWire.socketFolder(in: directory)
@@ -1476,7 +1482,8 @@ final class DeviceControlHub: @unchecked Sendable {
                 }) {
                     try walked.elements(limit: limit)
                 }
-                return .init(ok: true, captions: found.captions, complete: found.complete)
+                return .init(ok: true, captions: found.elements.map(\.caption), elements: found.elements,
+                             complete: found.complete)
             case "swipe":
                 // A request refused for what it says leaves the look to be used: it is spent by what reaches the device.
                 guard pointable() != nil, let size = h.looked else { return .failure(Self.lookFirst) }
@@ -1498,6 +1505,33 @@ final class DeviceControlHub: @unchecked Sendable {
                     session.interrupt()
                 }) {
                     try session.swipe(from: from, to: to, milliseconds: duration)
+                }
+                went()
+                return .init(ok: true)
+            case "pinch":
+                // As a swipe; the scale and the turn are refused by the library, the look left standing.
+                guard pointable() != nil, let size = h.looked else { return .failure(Self.lookFirst) }
+                guard request.look ?? size.id == size.id
+                else { return .failure(Self.lookedSince(request.look ?? size.id)) }
+                guard Date().timeIntervalSince(size.at) <= lookStands else { end()
+                    return .failure(Self.lookOld)
+                }
+                guard let centre = Self.fraction(x: request.x, y: request.y, of: (size.width, size.height)) else {
+                    return .failure("the point must be inside the image (\(size.width) x \(size.height))")
+                }
+                guard let duration = Self.pinchDuration(request.milliseconds) else {
+                    return .failure("a pinch takes 50...5000 ms")
+                }
+                begun = true
+                try Self.whileWanted(wanted, else: {
+                    session.interrupt()
+                }) {
+                    try session.pinch(
+                        at: centre,
+                        scale: request.scale ?? 1,
+                        degrees: request.degrees ?? 0,
+                        milliseconds: duration
+                    )
                 }
                 went()
                 return .init(ok: true)
