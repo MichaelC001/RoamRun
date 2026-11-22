@@ -6,6 +6,32 @@
 
 iOS、Xcode、`remotepairingd` の動作についての記述は、RoamRun を作る過程で、実際の動作を見て確かめたものです。これは RoamRun ではなく Apple の動作なので、新しいリリースで変わる可能性があります。
 
+## なぜ必要か
+
+iOS 17 以降のワイヤレスデバッグは、Bonjour（`_remotepairing._tcp`）でデバイスを探します。Bonjour はローカルネットワークの中だけで働くので、Tailscale のような VPN は越えられません。そのうえ、Mac の `remotepairingd` は、デバイスを見つけたネットワークインターフェイスに接続を限定します（動作を見て確かめたことです）。そのため、デバイスの VPN 上のアドレスを知らせるだけでは足りません。
+
+そこで RoamRun は、Xcode には「デバイスは同じ Wi-Fi にある」と見せて、実際の通信を VPN に流します。
+
+```mermaid
+flowchart LR
+  subgraph mac["自宅の Mac"]
+    xcode["Xcode<br/>devicectl"] --> rpd["remotepairingd<br/>（Apple）"]
+    subgraph rr["RoamRun"]
+      fake["代わりの<br/>Bonjour<br/>レコード<br/>この Mac を指す"]
+      relay["中継<br/>Mac の LAN 側"]
+    end
+    rpd ~~~ fake
+    fake -. "① RoamRun が<br/>iPhone を知らせる" .-> rpd
+    rpd -- "② この Mac に接続" --> relay
+  end
+  subgraph away["外出先"]
+    iphone["iPhone<br/>どこかの Wi-Fi"]
+  end
+  relay <== "③ Tailscale 経由" ==> iphone
+```
+
+ペアリングの検証と暗号化は、Apple の実装のまま、Mac とデバイスの間で行われます。RoamRun は通信を中継するだけで、中身を読むことも書き換えることもありません。
+
 ## ブリッジ
 
 iOS 17 以降のワイヤレスデバッグは、Apple の CoreDevice の上で動きます。Mac の `remotepairingd` は、Bonjour（`_remotepairing._tcp`）でローカルネットワーク上のデバイスを探します。Bonjour はリンクローカルのマルチキャストなので、Tailscale のようなレイヤー 3 の VPN は越えられません。そのうえ、`remotepairingd` は、デバイスを見つけたインターフェイスに接続を限定します。そのため、デバイスの VPN 上のアドレスを公開するだけでは動きません。
@@ -51,14 +77,14 @@ sequenceDiagram
 ```mermaid
 flowchart RL
   subgraph home["デバイスのそばの Mac"]
-    fake["代わりの Bonjour レコード<br/>（離れた Mac のオファー。接続先はデバイスのそばの Mac）"]
-    relay["RoamRun の中継<br/>（デバイスのアドレスからだけ受ける）"]
+    fake["代わりの<br/>Bonjour<br/>レコード<br/>（離れた Mac の<br/>オファー。<br/>接続先は<br/>デバイスの<br/>そばの Mac）"]
+    relay["RoamRun の<br/>中継<br/>（デバイスの<br/>アドレスから<br/>だけ受ける）"]
   end
   subgraph far["離れた Mac"]
-    host["Xcode か RoamRun のアプリ<br/>（ペアリングを待つ。鍵はここで作られ、ここに残る）"]
+    host["Xcode か<br/>RoamRun の<br/>アプリ<br/>（ペアリングを<br/>待つ。鍵は<br/>ここで作られ、<br/>ここに残る）"]
   end
   iphone["iPhone / iPad"]
-  iphone -. "① “Pair with far-mac” を見つける" .-> fake
+  iphone -. "① “Pair with far-mac”<br/>を見つける" .-> fake
   iphone -- "② Wi-Fi 経由で接続" --> relay
   relay == "③ Tailscale 経由" ==> host
 ```

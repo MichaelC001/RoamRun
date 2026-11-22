@@ -8,6 +8,36 @@ What the bridge does, step by step, and where each part lives in the source. The
 Statements about what iOS, Xcode and `remotepairingd` do are what was seen while building RoamRun.
 They are Apple's behaviour, not RoamRun's, and a new release can change them.
 
+## Why it is needed
+
+Since iOS 17, wireless debugging finds devices with Bonjour (`_remotepairing._tcp`). Bonjour
+stays on the local network, so it does not cross a VPN such as Tailscale. The Mac's
+`remotepairingd` also ties its connection to the network interface where it found the device (as
+seen), so advertising the device's VPN address is not enough either.
+
+RoamRun tells Xcode that the device is on the same Wi-Fi, and carries the traffic over the VPN:
+
+```mermaid
+flowchart LR
+  subgraph mac["Mac at home"]
+    xcode["Xcode<br/>devicectl"] --> rpd["remotepairingd<br/>(Apple)"]
+    subgraph rr["RoamRun"]
+      fake["Stand-in<br/>Bonjour record<br/>pointing at<br/>this Mac"]
+      relay["Relay<br/>on the Mac's<br/>LAN interface"]
+    end
+    rpd ~~~ fake
+    fake -. "① RoamRun announces<br/>the iPhone" .-> rpd
+    rpd -- "② connects to this Mac" --> relay
+  end
+  subgraph away["Away"]
+    iphone["iPhone<br/>on some Wi-Fi"]
+  end
+  relay <== "③ over Tailscale" ==> iphone
+```
+
+Pairing verification and encryption stay end to end between the Mac and the device, as Apple
+implements them. RoamRun relays bytes; it does not read or change them.
+
 ## The bridge
 
 Since iOS 17, wireless debugging runs on Apple's CoreDevice stack. The Mac's `remotepairingd`
@@ -75,14 +105,14 @@ that the far Mac is on its Wi-Fi, and the traffic goes over Tailscale.
 ```mermaid
 flowchart RL
   subgraph home["Mac on the device's Wi-Fi"]
-    fake["Stand-in Bonjour record<br/>(the far Mac's offer, pointing at this Mac)"]
-    relay["RoamRun relay<br/>(takes the device's address only)"]
+    fake["Stand-in<br/>Bonjour record<br/>(the far Mac's<br/>offer, pointing<br/>at this Mac)"]
+    relay["RoamRun relay<br/>(takes the<br/>device's<br/>address only)"]
   end
   subgraph far["Far Mac"]
-    host["Xcode, or the RoamRun app<br/>(waiting to pair, the key is made and stays here)"]
+    host["Xcode, or the<br/>RoamRun app<br/>(waiting to pair,<br/>the key is made<br/>and stays here)"]
   end
   iphone["iPhone / iPad"]
-  iphone -. "① finds “Pair with far-mac”" .-> fake
+  iphone -. "① finds<br/>“Pair with far-mac”" .-> fake
   iphone -- "② connects over Wi-Fi" --> relay
   relay == "③ over Tailscale" ==> host
 ```
