@@ -342,6 +342,9 @@ final class DeviceMCP: @unchecked Sendable {
                 +
                 text(
                     "\(Int(size.width)) x \(Int(size.height)), look \(id). Points for tap, swipe and pinch are pixels of this image, given with look \(id). Within a minute it serves one tap, swipe, pinch, type or paste, and type and paste after that: look again before another tap, swipe or pinch."
+                        + (looked.said.map {
+                            " (The device's PNG: \($0).)"
+                        } ?? "")
                 )
         case "tap":
             let look = try Self.look(of: arguments)
@@ -572,7 +575,8 @@ final class DeviceMCP: @unchecked Sendable {
     has focus. Press goes to whatever is on the screen: look before it too. These press what is really \
     there — don't tap what spends money, posts, sends, deletes or signs in unless the user asked \
     for exactly that. A look shows whatever is on the screen (notifications, messages); don't pass \
-    the image on. The device lists this as screen sharing, where its user can see it: until about \
+    the image on. The device lists this as screen sharing, where its user can see it (not while it \
+    refuses the screen stream, as while its microphone or camera is in use): until about \
     five seconds after the last look or action, voice input on it may not hear and some apps go \
     silent or stop playing. Asked to keep watching a screen, tell the user that first.
     """
@@ -685,7 +689,7 @@ final class DeviceMCP: @unchecked Sendable {
             tool("devices", "The devices saved in RoamRun, one name a line."),
             tool(
                 "look",
-                "The device's screen now, as an image, and the look's id. Do this before every tap, swipe or pinch: it serves one, which gives that id."
+                "The device's screen now, as an image, and the look's id. Do this before every tap, swipe or pinch: it serves one, which gives that id. Where the screen stream gives no frame to use (refused during a call or while the microphone or camera is in use, unreadable, not fitting the screen, or the screen's size unsaid; not where the stream doesn't answer), the look is the device's own PNG, slower, and says so; a point by it is refused once the device was turned since or as it was taken, or while it is on its side without saying which way."
             ),
             tool("tap", "Tap a point of the last look. Operates the device: whatever is there gets pressed.",
                  ["look": lookGiven, "x": point, "y": point], required: ["look", "x", "y"]),

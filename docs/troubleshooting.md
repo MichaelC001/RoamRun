@@ -30,12 +30,15 @@ When in trouble, run `roamrun doctor` first.
 - **If another Mac is on the same network**, the device may briefly show up in that Mac's Xcode
   too. The relay refuses that Mac's connections.
 - **Seeing or operating the device runs a screen-sharing session on it**, which lasts until about
-  five seconds after the last look or action.
+  five seconds after the last look or action. Not while the device refuses the screen stream (while
+  its microphone or camera is in use, or during a call): a look is then its own PNG, and an action
+  goes without the stream.
 
 ## Known problems
 
-- **If macOS blocks RoamRun's local-network access, the device always looks "away"**, and RoamRun
-  goes on bridging a device that sits beside it. RoamRun says so in its window, its log,
+- **If macOS blocks RoamRun's local-network access, a device beside the Mac can look "away"**, and
+  RoamRun goes on bridging it. Where `tailscale ping` reaches the device directly on this Mac's
+  network, it is "On this Wi‑Fi" all the same (seen). RoamRun says so in its window, its log,
   `roamrun status` and `roamrun doctor`. Allow RoamRun under System Settings › Privacy & Security ›
   Local Network. If the switch is already on, the permission is stuck. The only way found to clear
   it was to uninstall with `brew uninstall --zap` and install again
@@ -49,7 +52,9 @@ When in trouble, run `roamrun doctor` first.
 - **Tailscale on iOS has been seen to stop passing traffic** after sleep or a network change while
   it still looks connected ("MagicSock function ReceiveIPv4 is not running"). Turn the VPN off and
   on.
-- **A device plugged in over USB can keep a bridged one from becoming Ready.** Unplug it.
+- **Quitting RoamRun while Xcode debugs over the bridge ends the session**: the tunnel closes with it.
+  Tried on 2026-11-26 with Xcode 27.2: Stop ended the run in Xcode, the app kept running on the
+  device, and Run started it again. On 0.1.18, Stop had done nothing and Xcode had to be reopened.
 - **Xcode's session does not survive the Mac sleeping for minutes.** Run again afterwards.
 - **After the device restarts**, its pairing port may have changed: use Find RemotePairing Port on
   the device's page. Xcode has also needed the device on USB once after a restart, to prepare it

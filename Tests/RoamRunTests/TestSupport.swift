@@ -359,14 +359,26 @@ final class StandInDevice: ControlledDevice, @unchecked Sendable {
     /// What an input, or a look, throws when set (after it was sent, as the device's own do).
     var failing: (any Error)?
     var lookFailing: (any Error)?
-    func look() throws -> CGImage {
+    /// Set, a look is the device's PNG, its interface that way up; and what `way` says now.
+    var lookWay: UInt8?
+    var wayNow: UInt8 = 1
+    /// Run as `way` is asked, as whoever asked leaving meanwhile.
+    var onWay: (@Sendable () -> Void)?
+    func way() -> UInt8 {
+        onWay?()
+        return lock.withLock {
+            wayNow
+        }
+    }
+
+    func look() throws -> DeviceSession.Look {
         count("look")
         lookBegan.signal()
         held(hold)
         if let lookFailing {
             throw lookFailing
         }
-        return CGContext(
+        let image = CGContext(
             data: nil,
             width: screen.width,
             height: screen.height,
@@ -375,6 +387,9 @@ final class StandInDevice: ControlledDevice, @unchecked Sendable {
             space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
         )!.makeImage()!
+        return DeviceSession.Look(image: image, way: lookWay, fellBack: lookWay.map {
+            _ in "the screen stream gave none: a call"
+        })
     }
 
     /// The size of the screen a look shows.
